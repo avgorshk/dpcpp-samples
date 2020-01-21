@@ -159,27 +159,28 @@ std::vector<float> ComputeMKL(cl::sycl::queue& queue,
     cl::sycl::buffer<float, 1> r_buf(r.data(), r.size());
     cl::sycl::buffer<float, 1> ar_buf(ar.data(), ar.size());
 
-    float ar_r = 0.0f, ar_ar = 0.0f, tau = 0.0f;
+    float ar_r = 0.0f, ar_ar = 0.0f, norm = 0.0f, tau = 0.0f;
     cl::sycl::buffer<float, 1> ar_r_buf(&ar_r, 1);
     cl::sycl::buffer<float, 1> ar_ar_buf(&ar_ar, 1);
+    cl::sycl::buffer<float, 1> norm_buf(&norm, 1);
 
     for (int it = 0; it < count; ++it) {
       // r <- Ax - b
       mkl::blas::copy(queue, size, b_buf, 1, r_buf, 1);
       mkl::blas::gemv(queue, mkl::transpose::N, size, size, 1.0f, a_buf, size, x_buf, 1, -1.0f, r_buf, 1);
+      mkl::blas::dot(queue, size, r_buf, 1, r_buf, 1, norm_buf);
+      auto norm_acc = norm_buf.get_access<cl::sycl::access::mode::read>();
+      if (sqrtf(norm_acc[0]) < EPS) {
+        count = it;
+        break;
+      }
 
       // tau = (Ar, r) / (Ar, Ar)
       mkl::blas::gemv(queue, mkl::transpose::N, size, size, 1.0f, a_buf, size, r_buf, 1, 0.0f, ar_buf, 1);
       mkl::blas::dot(queue, size, ar_buf, 1, r_buf, 1, ar_r_buf);
       mkl::blas::dot(queue, size, ar_buf, 1, ar_buf, 1, ar_ar_buf);
-      
       auto ar_r_acc = ar_r_buf.get_access<cl::sycl::access::mode::read>();
       auto ar_ar_acc = ar_ar_buf.get_access<cl::sycl::access::mode::read>();
-      if (sqrtf(ar_r_acc[0]) < EPS || sqrtf(ar_ar_acc[0]) < EPS) {
-        count = it;
-        break;
-      }
-
       tau = ar_r_acc[0] / ar_ar_acc[0];
 
       // x <- x - tau * r
