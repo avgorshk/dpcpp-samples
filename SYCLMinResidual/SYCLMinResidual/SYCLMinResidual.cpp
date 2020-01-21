@@ -4,26 +4,42 @@
 
 #include <assert.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <CL/sycl.hpp>
 
-#define AVALUE 2.4f
-#define BVALUE 1024.2f
+#define EPS 1.0e-5f
+
+using HostReadAccessor = cl::sycl::accessor<float, 1,
+  cl::sycl::access::mode::read,
+  cl::sycl::access::target::host_buffer>;
+
+class ComputeR;
+class ComputeAr;
+class ComputeX;
+
+float Dot(const HostReadAccessor& a,
+          const HostReadAccessor& b) {
+  assert(a.get_count() == b.get_count());
+  
+  float dot = 0.0f;
+  for (size_t i = 0; i < a.get_count(); ++i) {
+    dot += a[i] * b[i];
+  }
+
+  return dot;
+}
 
 std::vector<float> ComputeNative(const std::vector<float>& a,
                                  const std::vector<float>& b,
-                                 bool cpu) {
+                                 int& count, bool cpu) {
   assert(a.size() == b.size() * b.size());
   size_t size = b.size();
 
-  std::vector<float> x1(size, 0.0f);
-  std::vector<float> x2(size, 0.0f);
-
-  cl::sycl::buffer<float, 1> a_buf(a.data(), a.size());
-  cl::sycl::buffer<float, 1> b_buf(b.data(), b.size());
-  cl::sycl::buffer<float, 1> x1_buf(x1.data(), x1.size());
-  cl::sycl::buffer<float, 1> x2_buf(x2.data(), x2.size());
+  std::vector<float> x(size, 0.0f);
+  std::vector<float> r(size, 0.0f);
+  std::vector<float> ar(size, 0.0f);
 
   std::unique_ptr<cl::sycl::device_selector> selector(nullptr);
   if (cpu) {
@@ -33,35 +49,104 @@ std::vector<float> ComputeNative(const std::vector<float>& a,
   }
 
   try {
+    cl::sycl::buffer<float, 1> a_buf(a.data(), a.size());
+    cl::sycl::buffer<float, 1> b_buf(b.data(), b.size());
+    cl::sycl::buffer<float, 1> x_buf(x.data(), x.size());
+    cl::sycl::buffer<float, 1> r_buf(r.data(), r.size());
+    cl::sycl::buffer<float, 1> ar_buf(ar.data(), ar.size());
+
     cl::sycl::queue queue(*selector.get(), cl::sycl::async_handler{});
     std::cout << "Target device: " <<
       queue.get_info<cl::sycl::info::queue::device>().get_info<
-      cl::sycl::info::device::name>() << std::endl;
+        cl::sycl::info::device::name>() << std::endl;
 
-    queue.submit([&](cl::sycl::handler& cgh) {
-      auto a_acc = a_buf.get_access<cl::sycl::access::mode::read>(cgh);
-      auto b_acc = b_buf.get_access<cl::sycl::access::mode::read>(cgh);
-      auto x1_acc = x1_buf.get_access<cl::sycl::access::mode::read_write>(cgh);
-      auto x2_acc = x2_buf.get_access<cl::sycl::access::mode::read_write>(cgh);
+    for (int it = 0; it < count; ++it) {
 
-      //cgh.parallel_for<class VectorAdd>(num_items, [=](nd_item<1> wiID) {
-      //});
-    });
+      // r <- Ax - b
+      queue.submit([&](cl::sycl::handler& cgh) {
+        auto a_acc = a_buf.get_access<cl::sycl::access::mode::read>(cgh);
+        auto b_acc = b_buf.get_access<cl::sycl::access::mode::read>(cgh);
+        auto x_acc = x_buf.get_access<cl::sycl::access::mode::read>(cgh);
+        auto r_acc = r_buf.get_access<cl::sycl::access::mode::write>(cgh);
 
+        cgh.parallel_for<class ComputeR>(cl::sycl::range<1>(size),
+                                          [=](cl::sycl::id<1> id) {
+          float sum = 0.0f;
+          for (int i = 0; i < size; ++i) {
+            sum += a_acc[id * size + i] * x_acc[i];
+          }
+          r_acc[id] = sum - b_acc[id];
+        });
+      });
+
+      {
+        auto r_acc = r_buf.get_access<cl::sycl::access::mode::read>();
+        float norm = sqrtf(Dot(r_acc, r_acc));
+        if (norm < EPS) {
+          count = it;
+          break;
+        }
+      }
+
+      // Ar
+      queue.submit([&](cl::sycl::handler& cgh) {
+        auto a_acc = a_buf.get_access<cl::sycl::access::mode::read>(cgh);
+        auto r_acc = r_buf.get_access<cl::sycl::access::mode::read>(cgh);
+        auto ar_acc = ar_buf.get_access<cl::sycl::access::mode::write>(cgh);
+
+        cgh.parallel_for<class ComputeAr>(cl::sycl::range<1>(size),
+                                          [=](cl::sycl::id<1> id) {
+          float sum = 0.0f;
+          for (int i = 0; i < size; ++i) {
+            sum += a_acc[id * size + i] * r_acc[i];
+          }
+          ar_acc[id] = sum;
+        });
+      });
+
+      // tau <- (Ar, r) / (Ar, Ar)
+      float tau = 0.0f;
+      {
+        auto ar_acc = ar_buf.get_access<cl::sycl::access::mode::read>();
+        auto r_acc = r_buf.get_access<cl::sycl::access::mode::read>();
+        float ar_r = Dot(ar_acc, r_acc);
+        float ar_ar = Dot(ar_acc, ar_acc);
+        assert(ar_ar > 0.0f);
+        tau = ar_r / ar_ar;
+      }
+
+      // x <- x - tau * r
+      queue.submit([&](cl::sycl::handler& cgh) {
+        auto r_acc = r_buf.get_access<cl::sycl::access::mode::read>(cgh);
+        auto x_acc = x_buf.get_access<cl::sycl::access::mode::read_write>(cgh);
+
+        cgh.parallel_for<class ComputeX>(cl::sycl::range<1>(size),
+                                          [=](cl::sycl::id<1> id) {
+          x_acc[id] -= tau * r_acc[id];
+        });
+      });
+
+    }
+
+    queue.wait_and_throw();
   } catch (std::exception e) {
     std::cout << "Error: " << e.what() << std::endl;
   }
 
-  return std::vector<float>(b.size(), 0.0f);
+  return x;
 }
 
 std::vector<float> GenerateMatrix(int size) {
   std::vector<float> matrix(size * size);
   for (auto& value : matrix) {
-    value = AVALUE;
+    value = static_cast<float>(rand()) / RAND_MAX;
   }
   for (size_t i = 0; i < size; ++i) {
-    matrix[i * size + i] = size * AVALUE + AVALUE;
+    float sum = 0.0f;
+    for (size_t j = 0; j < size; ++j) {
+      sum += matrix[i * size + j];
+    }
+    matrix[i * size + i] = 2.0f * sum;
   }
   return matrix;
 }
@@ -69,7 +154,7 @@ std::vector<float> GenerateMatrix(int size) {
 std::vector<float> GenerateVector(int size) {
   std::vector<float> vector(size);
   for (auto& value : vector) {
-    value = BVALUE;
+    value = static_cast<float>(rand()) / RAND_MAX;
   }
   return vector;
 }
@@ -129,6 +214,7 @@ int main(int argc, char* argv[]) {
     cpu = true;
   }
 
+  srand(777);
   std::vector<float> a = GenerateMatrix(size);
   std::vector<float> b = GenerateVector(size);
   std::vector<float> x;
@@ -137,7 +223,7 @@ int main(int argc, char* argv[]) {
   if (mkl) {
 
   } else {
-    x = ComputeNative(a, b, cpu);
+    x = ComputeNative(a, b, count, cpu);
   }
   auto end = std::chrono::steady_clock::now();
   float time =
@@ -146,7 +232,8 @@ int main(int argc, char* argv[]) {
   std::cout << "Execution time: " << time << " ms" << std::endl;
 
   float eps = ComputeError(a, b, x);
-  std::cout << "Error: " << eps << std::endl;
+  std::cout << "Error " << eps << " in " << count <<
+    " iterations" << std::endl;
 
   return 0;
 }
