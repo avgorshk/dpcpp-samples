@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include <CL/sycl.hpp>
+#include <mkl_blas_sycl.hpp>
 
 #define EPS 1.0e-5f
 
@@ -18,6 +19,19 @@ using HostReadAccessor = cl::sycl::accessor<float, 1,
 class ComputeR;
 class ComputeAr;
 class ComputeX;
+
+std::vector<float> Transpose(const std::vector<float>& a, int size) {
+  assert(size * size == a.size());
+  std::vector<float> at(size * size);
+
+  for (int i = 0; i < size; ++i) {
+    for (int j = 0; j < size; ++j) {
+      at[i * size + j] = a[j * size + i];
+    }
+  }
+
+  return at;
+}
 
 float Dot(const HostReadAccessor& a,
           const HostReadAccessor& b) {
@@ -31,49 +45,39 @@ float Dot(const HostReadAccessor& a,
   return dot;
 }
 
-std::vector<float> ComputeNative(const std::vector<float>& a,
+std::vector<float> ComputeNative(cl::sycl::queue& queue,
+                                 const std::vector<float>& a,
                                  const std::vector<float>& b,
-                                 int& count, bool cpu) {
+                                 int& count) {
   assert(a.size() == b.size() * b.size());
   size_t size = b.size();
 
+  std::vector<float> at = Transpose(a, size);
   std::vector<float> x(size, 0.0f);
   std::vector<float> r(size, 0.0f);
   std::vector<float> ar(size, 0.0f);
 
-  std::unique_ptr<cl::sycl::device_selector> selector(nullptr);
-  if (cpu) {
-    selector.reset(new cl::sycl::cpu_selector);
-  } else {
-    selector.reset(new cl::sycl::gpu_selector);
-  }
-
   try {
-    cl::sycl::buffer<float, 1> a_buf(a.data(), a.size());
+    cl::sycl::buffer<float, 1> at_buf(at.data(), at.size());
     cl::sycl::buffer<float, 1> b_buf(b.data(), b.size());
     cl::sycl::buffer<float, 1> x_buf(x.data(), x.size());
     cl::sycl::buffer<float, 1> r_buf(r.data(), r.size());
     cl::sycl::buffer<float, 1> ar_buf(ar.data(), ar.size());
 
-    cl::sycl::queue queue(*selector.get(), cl::sycl::async_handler{});
-    std::cout << "Target device: " <<
-      queue.get_info<cl::sycl::info::queue::device>().get_info<
-        cl::sycl::info::device::name>() << std::endl;
-
     for (int it = 0; it < count; ++it) {
 
       // r <- Ax - b
       queue.submit([&](cl::sycl::handler& cgh) {
-        auto a_acc = a_buf.get_access<cl::sycl::access::mode::read>(cgh);
+        auto at_acc = at_buf.get_access<cl::sycl::access::mode::read>(cgh);
         auto b_acc = b_buf.get_access<cl::sycl::access::mode::read>(cgh);
         auto x_acc = x_buf.get_access<cl::sycl::access::mode::read>(cgh);
         auto r_acc = r_buf.get_access<cl::sycl::access::mode::write>(cgh);
 
         cgh.parallel_for<class ComputeR>(cl::sycl::range<1>(size),
-                                          [=](cl::sycl::id<1> id) {
+                                         [=](cl::sycl::id<1> id) {
           float sum = 0.0f;
           for (int i = 0; i < size; ++i) {
-            sum += a_acc[id * size + i] * x_acc[i];
+            sum += at_acc[i * size + id] * x_acc[i];
           }
           r_acc[id] = sum - b_acc[id];
         });
@@ -90,7 +94,7 @@ std::vector<float> ComputeNative(const std::vector<float>& a,
 
       // Ar
       queue.submit([&](cl::sycl::handler& cgh) {
-        auto a_acc = a_buf.get_access<cl::sycl::access::mode::read>(cgh);
+        auto at_acc = at_buf.get_access<cl::sycl::access::mode::read>(cgh);
         auto r_acc = r_buf.get_access<cl::sycl::access::mode::read>(cgh);
         auto ar_acc = ar_buf.get_access<cl::sycl::access::mode::write>(cgh);
 
@@ -98,7 +102,7 @@ std::vector<float> ComputeNative(const std::vector<float>& a,
                                           [=](cl::sycl::id<1> id) {
           float sum = 0.0f;
           for (int i = 0; i < size; ++i) {
-            sum += a_acc[id * size + i] * r_acc[i];
+            sum += at_acc[i * size + id] * r_acc[i];
           }
           ar_acc[id] = sum;
         });
@@ -126,6 +130,60 @@ std::vector<float> ComputeNative(const std::vector<float>& a,
         });
       });
 
+    }
+
+    queue.wait_and_throw();
+  } catch (std::exception e) {
+    std::cout << "Error: " << e.what() << std::endl;
+  }
+
+  return x;
+}
+
+std::vector<float> ComputeMKL(cl::sycl::queue& queue,
+                              const std::vector<float>& a,
+                              const std::vector<float>& b,
+                              int& count) {
+  assert(a.size() == b.size() * b.size());
+  size_t size = b.size();
+  
+  std::vector<float> at = Transpose(a, size);
+  std::vector<float> x(size, 0.0f);
+  std::vector<float> r(size, 0.0f);
+  std::vector<float> ar(size, 0.0f);
+
+  try {
+    cl::sycl::buffer<float, 1> a_buf(at.data(), at.size());
+    cl::sycl::buffer<float, 1> b_buf(b.data(), b.size());
+    cl::sycl::buffer<float, 1> x_buf(x.data(), x.size());
+    cl::sycl::buffer<float, 1> r_buf(r.data(), r.size());
+    cl::sycl::buffer<float, 1> ar_buf(ar.data(), ar.size());
+
+    float ar_r = 0.0f, ar_ar = 0.0f, tau = 0.0f;
+    cl::sycl::buffer<float, 1> ar_r_buf(&ar_r, 1);
+    cl::sycl::buffer<float, 1> ar_ar_buf(&ar_ar, 1);
+
+    for (int it = 0; it < count; ++it) {
+      // r <- Ax - b
+      mkl::blas::copy(queue, size, b_buf, 1, r_buf, 1);
+      mkl::blas::gemv(queue, mkl::transpose::N, size, size, 1.0f, a_buf, size, x_buf, 1, -1.0f, r_buf, 1);
+
+      // tau = (Ar, r) / (Ar, Ar)
+      mkl::blas::gemv(queue, mkl::transpose::N, size, size, 1.0f, a_buf, size, r_buf, 1, 0.0f, ar_buf, 1);
+      mkl::blas::dot(queue, size, ar_buf, 1, r_buf, 1, ar_r_buf);
+      mkl::blas::dot(queue, size, ar_buf, 1, ar_buf, 1, ar_ar_buf);
+      
+      auto ar_r_acc = ar_r_buf.get_access<cl::sycl::access::mode::read>();
+      auto ar_ar_acc = ar_ar_buf.get_access<cl::sycl::access::mode::read>();
+      if (sqrtf(ar_r_acc[0]) < EPS || sqrtf(ar_ar_acc[0]) < EPS) {
+        count = it;
+        break;
+      }
+
+      tau = ar_r_acc[0] / ar_ar_acc[0];
+
+      // x <- x - tau * r
+      mkl::blas::axpy(queue, size, -tau, r_buf, 1, x_buf, 1);
     }
 
     queue.wait_and_throw();
@@ -219,11 +277,35 @@ int main(int argc, char* argv[]) {
   std::vector<float> b = GenerateVector(size);
   std::vector<float> x;
 
+  std::unique_ptr<cl::sycl::device_selector> selector(nullptr);
+  if (cpu) {
+    selector.reset(new cl::sycl::cpu_selector);
+  } else {
+    selector.reset(new cl::sycl::gpu_selector);
+  }
+
+  cl::sycl::queue queue(*selector.get(), cl::sycl::async_handler{});
+  std::cout << "Target device: " <<
+    queue.get_info<cl::sycl::info::queue::device>().get_info<
+    cl::sycl::info::device::name>() << std::endl;
+
+  std::cout << "Warming-up...";
+  int temp_count = 1;
+  if (mkl) {
+    ComputeMKL(queue, a, b, temp_count);
+  } else {
+    ComputeNative(queue, a, b, temp_count);
+  }
+  std::cout << "OK" << std::endl;
+
+  std::cout << "Target mode: ";
   auto start = std::chrono::steady_clock::now();
   if (mkl) {
-
+    std::cout << "MKL" << std::endl;
+    x = ComputeMKL(queue, a, b, count);
   } else {
-    x = ComputeNative(a, b, count, cpu);
+    std::cout << "Native" << std::endl;
+    x = ComputeNative(queue, a, b, count);
   }
   auto end = std::chrono::steady_clock::now();
   float time =
