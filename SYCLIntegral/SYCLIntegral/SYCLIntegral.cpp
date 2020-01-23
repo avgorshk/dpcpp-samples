@@ -78,6 +78,8 @@ int main(int argc, char* argv[]) {
         }
       });
     });
+
+    queue.wait_and_throw();
   } catch (std::exception e) {
     std::cout << "Error: " << e.what() << std::endl;
   }
